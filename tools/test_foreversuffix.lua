@@ -179,6 +179,22 @@ check("a copy not placed yet is passed over", ns.Scanner.ReplicateSuffix(1) == n
 Prices:LearnSuffix(EAGLE, EAGLE_KEY)
 check("a placed one is read", ns.Scanner.ReplicateSuffix(2) == EAGLE_KEY)
 
+-- A quick scan keeps each link's answer for the rest of the read, so the
+-- same link is not taken apart on every row. Only answers that will not
+-- change are kept.
+print("\nthe same links again in one scan")
+
+local memo = {}
+check("a placed one is read through the scan's memo", ns.Scanner.ReplicateSuffix(2, memo) == EAGLE_KEY)
+check("and kept for the scan", memo.links[EAGLE] == EAGLE_KEY)
+check("a copy not placed yet is passed over", ns.Scanner.ReplicateSuffix(1, memo) == nil)
+check("and not kept", memo.links[MONKEY] == nil)
+Prices:LearnSuffix(MONKEY, MONKEY_KEY)
+check("so it is read once placed, in the same scan", ns.Scanner.ReplicateSuffix(1, memo) == MONKEY_KEY)
+C_AuctionHouse.GetReplicateItemLink = function() return PLAIN end
+check("a plain copy has none", ns.Scanner.ReplicateSuffix(3, memo) == nil)
+check("and that is kept too", memo.links[PLAIN] == false)
+
 for _, key in ipairs(GLOBALS) do _G[key] = saved[key] end
 
 print(("\n%d passed, %d failed"):format(passed, failed))

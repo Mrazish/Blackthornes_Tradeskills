@@ -1588,7 +1588,7 @@ local function Build(outer)
         L["Higher is faster, but the game can stutter."])
 
     widgets.budget = Widgets.CreateNumberBox(budgetRow, {
-        width = 60, min = 2, max = 16,
+        width = 60, min = 2, max = 50,
         onChange = function(value) Config:Set("scanBudgetMs", value) end,
     })
     widgets.budget:SetPoint("TOPLEFT", CONTROL_X, 0)

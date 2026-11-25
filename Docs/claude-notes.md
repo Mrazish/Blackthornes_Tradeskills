@@ -4003,3 +4003,23 @@ shadowed. While it shows, each arrow's `ArrowUI.Words` asks
 `TravelCard:Words(state)` and keeps only its name. `travelCardScale` is no
 longer read (left in saves). Tested in `tools/test_stepbox.lua` (the same in
 all five). Not yet seen in game.
+
+## Reading a quick scan fast (2026-11-25)
+
+A player's report: on a big auction house (245,000 rows, 7,000 items) the
+quick scan answered in seconds and the read took minutes. Each row asked
+`IsCommodity`, and for an item with no status on record that walked every
+bag slot (`notHeld` keeps a miss only ten seconds). `IsOwnAuction`,
+`ReplicateSuffix` and a stack size the client has not cached were also
+worked out again on every row.
+
+`ReadReplicateResults` now keeps, for one read: each item's commodity
+status, its stack size (a miss is asked again after a second), whose
+listing each seller's rows are, and each link's suffix (`ReplicateSuffix`'s
+`memo`; only a placed suffix or a link with no bonus is kept). The bags are
+walked once into an index (`scanBags`, passed to `GetCommodityStatus` and
+`LocateInBags`), and a slot that no longer holds the item falls back to the
+walk. Outside a scan, `LocateInBags` walks the bags as before.
+`Util.UnitPriceFromStack` takes the stack size when the caller has it
+(`false` means not cached). Scan Speed goes up to 50 ms. Tested in
+`tools/test_quickscanspeed.lua` and `tools/test_foreversuffix.lua`.

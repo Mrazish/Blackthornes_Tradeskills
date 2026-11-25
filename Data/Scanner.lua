@@ -183,13 +183,41 @@ function Scanner:ForgetNotHeld()
     notHeld = {}
 end
 
---- Find an item in the bags, as an ItemLocation.
---
--- GetItemCommodityStatus wants a location rather than an ID, so commodity
--- status can only be determined for something you are actually holding.
-local function LocateInBags(itemID)
-    if type(_G.ItemLocation) ~= "table" then return nil end
+-- A valid ItemLocation for bag/slot when itemID is still there, or nil.
+local function LocationAt(bag, slot, itemID)
+    local infoOk, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
+    if not (infoOk and info and info.itemID == itemID) then return nil end
 
+    -- A colon method: ItemLocation has to be passed as self.
+    local ok, location = pcall(ItemLocation.CreateFromBagAndSlot, ItemLocation, bag, slot)
+    if not (ok and location) then return nil end
+
+    local validOk, valid = pcall(location.IsValid, location)
+    if validOk and valid then return location end
+    return nil
+end
+
+-- itemID -> { bag, slot } of the first stack carried, in one walk of the
+-- bags. A full scan asks about thousands of items nobody holds, and a walk of
+-- every bag slot for each of them (a fresh table from GetContainerItemInfo
+-- per slot) was most of the time a quick scan spent reading.
+local function BuildBagIndex()
+    local index = {}
+    for _, bag in ipairs(ns.Inventory:GetCarriedBags()) do
+        local slotsOk, slots = pcall(C_Container.GetContainerNumSlots, bag)
+        if slotsOk and slots then
+            for slot = 1, slots do
+                local infoOk, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
+                local id = infoOk and info and info.itemID
+                if id and index[id] == nil then index[id] = { bag, slot } end
+            end
+        end
+    end
+    return index
+end
+
+-- Every slot, one at a time, for an item.
+local function WalkBags(itemID)
     -- Every container being carried, not the four ordinary bags: an item held
     -- only in a reagent bag would otherwise have no commodity status, and
     -- commodity status is what decides how the thing is priced and listed.
@@ -215,6 +243,25 @@ local function LocateInBags(itemID)
     end
 end
 
+--- Find an item in the bags, as an ItemLocation.
+--
+-- GetItemCommodityStatus wants a location rather than an ID, so commodity
+-- status can only be determined for something you are actually holding.
+--
+-- @param scanBags optional table kept for one quick scan's read: the bags
+--   are walked once into an index on first use and looked up from then on.
+--   A slot that no longer holds the item falls back to the walk.
+local function LocateInBags(itemID, scanBags)
+    if type(_G.ItemLocation) ~= "table" then return nil end
+    if not scanBags then return WalkBags(itemID) end
+
+    if not scanBags.index then scanBags.index = BuildBagIndex() end
+    local spot = scanBags.index[itemID]
+    if not spot then return nil end
+
+    return LocationAt(spot[1], spot[2], itemID) or WalkBags(itemID)
+end
+
 --- Does the auction house sell this by the stack rather than as one listing?
 --
 -- This decides whether posting uses PostCommodity or PostItem, and getting it
@@ -236,7 +283,8 @@ end
 -- @param location  optional ItemLocation the caller already holds, as the
 --   posting path does. It is asked about directly, so a listing never
 --   depends on the bag memo below being fresh.
-function Scanner:GetCommodityStatus(itemID, location)
+-- @param scanBags  optional, a quick scan's bag index (see LocateInBags)
+function Scanner:GetCommodityStatus(itemID, location, scanBags)
     if not itemID then return nil end
 
     local known = CommodityStore()[itemID]
@@ -250,7 +298,7 @@ function Scanner:GetCommodityStatus(itemID, location)
         local missedAt = notHeld[itemID]
         if missedAt and (GetTime() - missedAt) < NOT_HELD_SECONDS then return nil end
 
-        location = LocateInBags(itemID)
+        location = LocateInBags(itemID, scanBags)
         if not location then
             -- Not held, so there is nothing to ask about. Remembered only
             -- briefly: the answer becomes available as soon as one is in
@@ -820,11 +868,41 @@ function Scanner.MayHaveSuffix(itemID, quality, memo)
 end
 
 --- The suffix of a full scan's row, or nil. Read inside a pcall.
-function Scanner.ReplicateSuffix(index)
-    if not Util.HasFunction("C_AuctionHouse.GetReplicateItemLink") then return nil end
+-- @param memo optional table kept for one scan: whether the link call exists,
+--   and each distinct link's suffix, so the same link is parsed once rather
+--   than on every row. Only settled answers are kept (a suffix placed for
+--   sure, or a link with no suffix at all); one not placed yet is asked
+--   again, as the item's name may arrive later in the scan.
+function Scanner.ReplicateSuffix(index, memo)
+    local canLink = memo and memo.canLink
+    if canLink == nil then
+        canLink = Util.HasFunction("C_AuctionHouse.GetReplicateItemLink")
+        if memo then memo.canLink = canLink end
+    end
+    if not canLink then return nil end
+
     local ok, link = pcall(C_AuctionHouse.GetReplicateItemLink, index)
     if not ok or type(link) ~= "string" then return nil end
-    return LinkSuffix(link)
+    if not memo then return LinkSuffix(link) end
+
+    local links = memo.links
+    if not links then
+        links = {}
+        memo.links = links
+    end
+    local known = links[link]
+    if known ~= nil then return known or nil end
+
+    if type(Util.LinkSuffix) ~= "function" then return nil end
+    local found, sure = Util.LinkSuffix(link)
+    if found and sure ~= false then
+        links[link] = found
+        return found
+    end
+    if not found and type(Util.LinkBonuses) == "function" and #Util.LinkBonuses(link) == 0 then
+        links[link] = false
+    end
+    return nil
 end
 
 --- Browse rows put together into one reading per item.
@@ -1200,6 +1278,54 @@ function Scanner:ReadReplicateResults(numItems, reread)
     local suffixObservations = {}
     local suffixGear = {}
 
+    -- Answers that hold for every row of an item, worked out once a scan
+    -- rather than once a row. Most items come up in many rows, and the
+    -- commodity question alone used to walk every bag slot for anything not
+    -- held. See ReplicateSuffix for the links.
+    local commodityOf = {}
+    local stackMissUntil = {}
+    local ownBy = {}
+    local suffixMemo = {}
+    local scanBags = {}
+
+    local function CommodityOf(itemID)
+        local known = commodityOf[itemID]
+        if known == nil then
+            known = self:GetCommodityStatus(itemID, nil, scanBags) == true
+            commodityOf[itemID] = known
+        end
+        return known
+    end
+
+    -- The stack size, or false when the client has not cached the item. A
+    -- miss is asked again after a second, by when the item may have loaded.
+    local function MaxStack(itemID)
+        local until_ = stackMissUntil[itemID]
+        if until_ and GetTime() < until_ then return false end
+        local size = Util.GetMaxStackSize(itemID)
+        if size then return size end
+        stackMissUntil[itemID] = GetTime() + 1
+        return false
+    end
+
+    local function IsOwn(owner, ownerFullName)
+        if (owner ~= nil and type(owner) ~= "string")
+            or (ownerFullName ~= nil and type(ownerFullName) ~= "string") then
+            return self:IsOwnAuction(owner, ownerFullName)
+        end
+        local byFull = ownBy[ownerFullName or false]
+        if not byFull then
+            byFull = {}
+            ownBy[ownerFullName or false] = byFull
+        end
+        local own = byFull[owner or false]
+        if own == nil then
+            own = self:IsOwnAuction(owner, ownerFullName) == true
+            byFull[owner or false] = own
+        end
+        return own
+    end
+
     -- GetReplicateItemInfo is 0-based.
     local indices = {}
     for i = 0, numItems - 1 do
@@ -1357,8 +1483,12 @@ function Scanner:ReadReplicateResults(numItems, reread)
             -- stack-size guard kept its whole price as the price of one, and
             -- Wool Cloth at 1s each was stored at 40s.
             local unitPrice
-            if self:IsCommodity(itemID)
-                or (quantity > 1 and quantity > (Util.GetMaxStackSize(itemID) or quantity)) then
+            -- false (not cached) must reach UnitPriceFromStack as false, or it
+            -- looks the size up again: no `and ... or nil` here.
+            local maxStack
+            if quantity > 1 then maxStack = MaxStack(itemID) end
+            if CommodityOf(itemID)
+                or (quantity > 1 and quantity > (maxStack or quantity)) then
                 commodities[itemID] = true
                 if quantity > 1 and buyoutPrice >= quantity then
                     unitPrice = math.floor(buyoutPrice / quantity + 0.5)
@@ -1366,7 +1496,7 @@ function Scanner:ReadReplicateResults(numItems, reread)
                     unitPrice = buyoutPrice
                 end
             else
-                unitPrice = Util.UnitPriceFromStack(itemID, buyoutPrice, quantity)
+                unitPrice = Util.UnitPriceFromStack(itemID, buyoutPrice, quantity, maxStack)
             end
 
             -- A price nothing can pay is not a market observation, so it is
@@ -1394,7 +1524,7 @@ function Scanner:ReadReplicateResults(numItems, reread)
             local listing = {
                 unitPrice = unitPrice,
                 quantity = quantity,
-                isOwn = self:IsOwnAuction(owner, ownerFullName),
+                isOwn = IsOwn(owner, ownerFullName),
                 -- Only counted, for the Stats tab's sellers (Data/StatsLog.lua).
                 seller = type(owner) == "string" and owner or nil,
             }
@@ -1402,7 +1532,7 @@ function Scanner:ReadReplicateResults(numItems, reread)
 
             -- The same listing under its random suffix too, when it has one.
             if not commodities[itemID] and Scanner.MayHaveSuffix(itemID, quality, suffixGear) then
-                local suffix = Scanner.ReplicateSuffix(index)
+                local suffix = Scanner.ReplicateSuffix(index, suffixMemo)
                 if suffix then
                     local bySuffix = suffixObservations[itemID]
                     if not bySuffix then
